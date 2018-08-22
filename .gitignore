@@ -1,0 +1,3 @@
+.env.yaml
+keys/*
+node_modules
