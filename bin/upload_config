@@ -1,0 +1,21 @@
+#!/bin/bash
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
+
+command -v gsutil >/dev/null 2>&1 || { echo >&2 "I require gsutil but it's not installed.  Aborting."; exit 1; }
+command -v shyaml >/dev/null 2>&1 || { echo >&2 "I require shyaml but it's not installed.  Aborting."; exit 1; }
+
+if [[ ! -f "${DIR}/../.env.yaml" ]]; then
+  echo ".env.yaml file does not exist"
+  exit 1
+fi
+
+if [[ $1 == "" ]]; then
+  echo "Missing config file to upload"
+  exit 1
+fi
+
+STORAGE_CRON_JSON_FILE=`cat .env.yaml | shyaml get-value STORAGE_CRON_JSON_FILE`
+STORAGE_BUCKET_NAME=`cat .env.yaml | shyaml get-value STORAGE_BUCKET_NAME`
+
+gsutil cp "$1" "gs://${STORAGE_BUCKET_NAME}/${STORAGE_CRON_JSON_FILE}"

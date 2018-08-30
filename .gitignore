@@ -1,3 +1,6 @@
 .env.yaml
 keys/*
 node_modules
+bin/deploy_test
+.projectname
+cron.json
