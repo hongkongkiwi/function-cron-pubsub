@@ -1,6 +1,8 @@
 .env.yaml
+.env.prod.yaml
 keys/*
 node_modules
 bin/deploy_test
 .projectname
 cron.json
+.DS_Store

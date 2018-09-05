@@ -37,15 +37,20 @@ const KEYS_DIR = path.join(__dirname, 'keys')
 const projectId = process.env.GCP_PROJECT || null
 const configStorageBucketName = process.env.STORAGE_BUCKET_NAME || null
 const configStorageCronFile = process.env.STORAGE_CRON_JSON_FILE || 'cron.json'
+const configStorageLastRunFile = process.env.STORAGE_LASTRUN_FILE || 'lastrun'
 const configStorageNextRunsFile = process.env.STORAGE_NEXT_RUNS_JSON_FILE || 'next_runs.json'
 const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(KEYS_DIR,process.env.CREDENTIALS_STORAGE_SERVICE) : null
 const credsPubSub = process.env.CREDENTIALS_PUBSUB ? path.join(KEYS_DIR,process.env.CREDENTIALS_PUBSUB) : null
 const timezone = process.env.TZ || 'Asia/Tokyo'
+const httpKey = process.env.HTTP_KEY || null
+const minRerunSeconds = 58
 
-if (isNull(projectId) ||
+if (isNull(httpKey) ||
+    isNull(projectId) ||
     isNull(configStorageBucketName) ||
     isNull(configStorageCronFile) ||
     isNull(configStorageNextRunsFile) ||
+    isNull(configStorageLastRunFile) ||
     isNull(credsStorageService) ||
     isNull(credsPubSub)) {
       throw new Error("Environment Variables not available!")
@@ -66,10 +71,9 @@ const publishMessage = async (topicName, data) => {
   //   dataBuffer = buf.readUInt32BE(0)
   // } else if (isFloat(data)) {
   }
-  return pubsub
-    .topic(`projects/${process.env.GCP_PROJECT}/topics/${topicName}`)
-    .publisher()
-    .publish(dataBuffer)
+  const topicFullName = `projects/${process.env.GCP_PROJECT}/topics/${topicName}`
+  const publisher = pubsub.topic(topicFullName).publisher()
+  return publisher.publish(dataBuffer)
 }
 
 const listAllTopics = async () => {
@@ -118,7 +122,7 @@ const hashString = (str) => {
 const runCron = async (item) => {
   console.log('Run CRON:', item)
   if (item.action.type === 'http') {
-    unirest = unirest || require('unirest')
+    initUnirest()
     const method = item.action.method ? item.action.method.toUpperCase() : 'GET'
     const headers = item.action.headers || {}
     const body = item.action.body || null
@@ -129,12 +133,13 @@ const runCron = async (item) => {
     try {
       const response = await unirest(method, item.action.url, headers, body)
       if (response.code !== expectedStatusCode) {
-        throw new Error('Invalid Status Code Response!')
+        throw new Error(`Invalid Status Code Response! ${response.code}`)
       }
     } catch (err) {
       throw err
     }
   } else if (item.action.type === 'pubsub') {
+    initPubSub()
     try {
       if (!has(item.action, 'topic') || item.action.topic.length === 0) {
         throw new Error('No pubsub topic defined!')
@@ -142,45 +147,75 @@ const runCron = async (item) => {
       if (!has(item.action, 'data') || item.action.data.length === 0) {
         throw new Error('When using pubsub, must not have blank data!')
       }
-      await publishMessage(item.action.topic, item.action.data)
+      const messageId = await publishMessage(item.action.topic, item.action.data)
       console.log('PubSub Message Sent To Topic:',item.action.topic)
     } catch (err) {
       throw err
     }
+  } else {
+    throw new Error('Unknown action type')
   }
 }
 
-const handleCron = async () => {
+const initUnirest = () => {
+  unirest = unirest || require('unirest')
+}
+
+const initPubSub = () => {
   PubSub = PubSub || require('@google-cloud/pubsub')
   pubsub = pubsub || new PubSub({
-    keyFilename: path.join(__dirname,'keys',process.env.CREDENTIALS_PUBSUB)
+    keyFilename: path.join(__dirname,'keys',process.env.CREDENTIALS_PUBSUB),
+    autoRetry: true,
+    maxRetries: 3
   })
+}
+
+const initStorage = () => {
+  Storage = Storage || require('@google-cloud/storage')
+  configBucket = configBucket || new Storage({
+                        projectId: projectId,
+                        keyFilename: credsStorageService
+                    }).bucket(configStorageBucketName)
+}
+
+const seconds_from_date = (compDate) => {
+  return Math.round(Math.abs((new Date() - compDate) / 1000),0)
+}
+
+const handleCron = async () => {
   parser = parser || require('cron-parser')
 
   const options = {
     currentDate: Date.now(),
-    tz: 'Asia/Hong_Kong'
+    tz: timezone
   }
 
-  let cronItems = await getConfig('cron.json')
+  let cronItems = await getConfig(configStorageCronFile, true)
+  let lastRunTime = await getConfig(configStorageLastRunFile, false)
+  if (lastRunTime && seconds_from_date(new Date(parseInt(lastRunTime))) < minRerunSeconds) {
+    return
+  }
+  await saveConfig(configStorageLastRunFile, new Date().getTime(), false)
   if (isNull(cronItems)) {
-    await saveConfig(configStorageCronFile, {})
+    await saveConfig(configStorageCronFile, {}, true)
   }
   if (Object.keys(cronItems).length === 0) {
     throw new Error('No cron jobs in config file')
   }
-  let nextRuns = await getConfig(configStorageNextRunsFile) || {}
+  let nextRuns = await getConfig(configStorageNextRunsFile, true) || {}
   for (let item of cronItems) {
     if (!has(item,'id')) {
-      throw new Error(`Invalid Cron Entry (no id): ${item}`)
+      console.error(`Invalid Cron Entry (no id): ${item}`)
+      continue
     }
     const itemId = item.id
     if (!has(item,'interval')) {
-      throw new Error(`Invalid Cron Entry (no interval): ${item}`)
+      console.error(`Invalid Cron Entry (no interval): ${item}`)
+      continue
     }
     if (has(item,"enabled") && isBoolean(item.enabled) && item.enabled == false) {
       console.log('Cron Entry is disabled, skipping.')
-      return
+      continue
     }
     const itemHash = hashString(JSON.stringify(item))
     let nextRunDate
@@ -223,22 +258,22 @@ const handleCron = async () => {
       }
     }
   }
-  return saveConfig(configStorageNextRunsFile, nextRuns)
+  return saveConfig(configStorageNextRunsFile, nextRuns, true)
 }
 
-const getConfig = async (configName) => {
-  Storage = Storage || require('@google-cloud/storage')
-  configBucket = configBucket || new Storage({
-                        projectId: projectId,
-                        keyFilename: credsStorageService
-                    }).bucket(configStorageBucketName)
+const getConfig = async (configName, isJsonFile) => {
+  initStorage()
   let config
   try {
     const rawData = await configBucket.file(configName).download()
-    try {
-      config = JSON.parse(rawData)
-    } catch (e) {
-      config = null
+    if (isJsonFile) {
+      try {
+        config = JSON.parse(rawData)
+      } catch (e) {
+        config = null
+      }
+    } else {
+      config = rawData.toString()
     }
   } catch (err) {
     if (err.code ===  404) {
@@ -250,24 +285,15 @@ const getConfig = async (configName) => {
   return config
 }
 
-const saveConfig = async (configName, configData) => {
-  Storage = Storage || require('@google-cloud/storage')
-  configBucket = configBucket || new Storage({
-                        projectId: projectId,
-                        keyFilename: credsStorageService
-                    }).bucket(configStorageBucketName)
-  return await configBucket.file(configName).save(JSON.stringify(configData,null,1))
-}
-
-const handleGet = async (req, res) => {
-  try {
-    await handleCron()
-    console.log('Cron Finished!')
-    res.end(200, "OK")
-  } catch (err) {
-    console.error(err)
-    res.end(500, "Internal Error")
+const saveConfig = async (configName, configData, isJsonFile) => {
+  initStorage()
+  let dataToSave
+  if (isJsonFile) {
+    dataToSave = JSON.stringify(configData,null,1)
+  } else {
+    dataToSave = configData.toString()
   }
+  return await configBucket.file(configName).save(dataToSave)
 }
 
 /*
@@ -276,9 +302,24 @@ const handleGet = async (req, res) => {
 *  @param {object} response object created in response to the request
 */
 exports.http = async (req, res) => {
+  if (((has(req.headers,'key') || has(req.headers,'Key')) && (req.headers.key !== httpKey && req.headers.Key !== httpKey)) ||
+      ((has(req.query, 'key') || has(req.query, 'Key')) && (req.query.key !== httpKey && req.query.Key !== httpKey))) {
+    const passedKey = req.headers.Key ? req.headers.Key : req.query.Key
+    console.log(req.headers.key)
+    console.log((has(req.headers,'key') || has(req.headers,'Key')) && (req.headers.key !== httpKey && req.headers.Key !== httpKey))
+    console.error("User Passed Wrong Key", passedKey)
+    return res.status(401).end("Access Denied")
+  }
   switch (req.method) {
     case 'GET':
-      await handleGet(req, res)
+      try {
+        await handleCron()
+        console.log('Cron Finished!')
+        res.status(200).end("OK")
+      } catch (err) {
+        console.error(err)
+        res.status(500).end("Internal Error")
+      }
       break
     default:
       handleError(`Invalid Method ${req.method}`, res)
